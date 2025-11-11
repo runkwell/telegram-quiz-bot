@@ -1,8 +1,9 @@
 import sqlite3
 import re
+import json
 
 DB_FILE = 'quiz.db'
-GITHUB_RAW_BASE = 'https://raw.githubusercontent.com/runkwell/telegram-quiz-bot/main'  # Thay bằng repo thật, e.g., 'https://raw.githubusercontent.com/ChrisDevil55797/telegram-quiz-bot/main'
+GITHUB_RAW_BASE = 'https://raw.githubusercontent.com/runkwell/telegram-quiz-bot/main'
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -26,44 +27,51 @@ def init_db():
     conn.commit()
     conn.close()
 
-def parse_and_insert_questions(filename='pasted-text.txt'):
+def parse_and_insert_questions(filename='pasted-text.txt', update_existing=False, reset_images=False):
     init_db()
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
+    if reset_images:
+        cursor.execute("UPDATE questions SET image_url = NULL")
+        print("Đã reset tất cả image_url về NULL.")
+    
     with open(filename, 'r', encoding='utf-8') as f:
         content = f.read()
     
-    # Tách các câu hỏi bằng regex (dựa trên số + . + text + options + --------------------------------------------------)
-    questions_blocks = re.split(r'-{20,}', content)  # Split bằng dấu gạch ngang dài
+    questions_blocks = re.split(r'-{20,}', content)
     
     inserted_count = 0
+    updated_count = 0
     for block in questions_blocks:
         block = block.strip()
-        if not block or len(block) < 100:  # Skip empty/truncated
+        if not block or len(block) < 100:
             continue
         
-        # Tách số câu + question_text (dòng đầu, bao gồm images nếu có)
-        # Parse images trước: ![alt](images/filename.jpg) → extract filename
+        # Parse TẤT CẢ images
         image_matches = re.findall(r'!\[([^\]]+)\]\(images/([^\)]+\.jpg)\)', block)
-        image_url = None
+        images_json = []  # Array [urlA, urlB, ...]
         if image_matches:
-            # Lấy image đầu tiên (hoặc chỉnh logic nếu multiple)
-            alt, filename = image_matches[0]
-            image_url = f"{GITHUB_RAW_BASE}/images/{filename}"
-            print(f"Found image for alt '{alt}': {image_url}")
+            for alt, filename in image_matches:
+                raw_url = f"{GITHUB_RAW_BASE}/images/{filename}"
+                images_json.append(raw_url)
+                print(f"Found image for alt '{alt}': {raw_url}")
         
-        # Tách question_text (loại bỏ images markup để clean text)
-        clean_block = re.sub(r'!\[[^\]]+\]\(images/[^\)]+\)', '', block)  # Remove ![ ] markup
+        image_url_json = json.dumps(images_json) if images_json else None
+        
+        # Clean block
+        clean_block = re.sub(r'!\[[^\]]+\]\(images/[^\)]+\)', '', block)
+        
+        # Tách question_text
         q_match = re.match(r'(\d+\.\s+.+?)(?=\n\n|\n-{2,}|\Z)', clean_block, re.DOTALL)
         if not q_match:
             continue
         question_text = q_match.group(1).strip()
         
-        # Tìm options (dòng bắt đầu bằng - [ ] hoặc [x])
+        # Parse options
         options_lines = re.findall(r'-\s+\[([x ])\]\s+(.+)', clean_block)
         if len(options_lines) < 2:
-            continue  # Skip invalid
+            continue
         
         options = {}
         correct = []
@@ -77,15 +85,25 @@ def parse_and_insert_questions(filename='pasted-text.txt'):
         
         correct_str = ','.join(correct) if len(correct) > 1 else correct[0] if correct else ''
         
-        # Check duplicate (dựa trên question_text)
-        cursor.execute("SELECT id FROM questions WHERE question_text = ?", (question_text,))
-        if cursor.fetchone():
-            print(f"Skip duplicate: {question_text[:50]}...")
+        # Check duplicate/update
+        cursor.execute("SELECT id FROM questions WHERE question_text LIKE ?", (f"%{question_text[:50]}%",))
+        existing = cursor.fetchone()
+        if existing:
+            if update_existing:
+                cursor.execute('''
+                    UPDATE questions SET image_url = ?, num_options = ?, correct_answers = ?
+                    WHERE id = ?
+                ''', (image_url_json, num_options, correct_str, existing[0]))
+                if image_url_json:
+                    updated_count += 1
+                    print(f"Updated images JSON for: {question_text[:50]}... → {len(images_json)} images")
+            else:
+                print(f"Skip duplicate: {question_text[:50]}...")
             continue
         
-        # Insert
+        # Insert mới
         values = (
-            question_text, image_url,
+            question_text, image_url_json,
             options.get('A', ''), options.get('B', ''), options.get('C', ''), options.get('D', ''),
             options.get('E', ''), options.get('F', ''), options.get('G', ''),
             num_options, correct_str
@@ -96,11 +114,11 @@ def parse_and_insert_questions(filename='pasted-text.txt'):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', values)
         inserted_count += 1
-        print(f"Inserted: {question_text[:50]}... (correct: {correct_str}, image: {image_url or 'None'})")
+        print(f"Inserted: {question_text[:50]}... (correct: {correct_str}, images: {len(images_json)})")
     
     conn.commit()
     conn.close()
-    print(f"\nHoàn tất! Đã import {inserted_count} câu hỏi vào DB.")
+    print(f"\nHoàn tất! Insert {inserted_count}, update {updated_count}.")
 
 if __name__ == '__main__':
-    parse_and_insert_questions()
+    parse_and_insert_questions(update_existing=True, reset_images=True)

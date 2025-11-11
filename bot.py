@@ -2,11 +2,13 @@ import sqlite3
 import os
 import random
 import logging
+import json
+import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
-# Cấu hình logging
-logging.basicConfig(level=logging.INFO)
+# Cấu hình logging (DEBUG để check image_map)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Database setup
@@ -28,7 +30,7 @@ def init_db():
             option_f TEXT,
             option_g TEXT,
             num_options INTEGER DEFAULT 4,
-            correct_answers TEXT DEFAULT ''            
+            correct_answers TEXT DEFAULT ''
         )
     ''')
     conn.commit()
@@ -39,20 +41,8 @@ init_db()
 def migrate_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='questions';")
-    table_exists = cursor.fetchone() is not None
-    
-    if not table_exists:
-        print("Bảng chưa tồn tại, sẽ tạo mới qua init_db.")
-        conn.close()
-        init_db()
-        conn = sqlite3.connect(DB_FILE)  # Reconnect
-        cursor = conn.cursor()
-    
     cursor.execute("PRAGMA table_info(questions)")
     columns = [col[1] for col in cursor.fetchall()]
-    
     if 'num_options' not in columns:
         cursor.execute("ALTER TABLE questions ADD COLUMN num_options INTEGER DEFAULT 4")
     if 'correct_answers' not in columns:
@@ -61,17 +51,15 @@ def migrate_db():
         col_name = f'option_{opt}'
         if col_name not in columns:
             cursor.execute(f"ALTER TABLE questions ADD COLUMN {col_name} TEXT")
-    
     if 'correct_answer' in columns:
         cursor.execute("UPDATE questions SET correct_answers = correct_answer WHERE correct_answers = '' AND correct_answer IS NOT NULL")
-    
     conn.commit()
     conn.close()
 
 migrate_db()
 
 # Trạng thái Conversation
-QUESTION_TEXT, IMAGE_URL, NUM_OPTIONS, OPTIONS_INPUT, CORRECT_ANSWERS = range(5)
+QUESTION_TEXT, IMAGE_URL, NUM_OPTIONS, OPTIONS_INPUT, CORRECT_ANSWERS, EXAM_COUNT = range(6)
 
 # Lưu trạng thái quiz
 user_quizzes = {}
@@ -80,7 +68,7 @@ TOKEN = os.environ.get('TOKEN')
 if not TOKEN:
     raise ValueError("TOKEN chưa được set!")
 
-# Helper lấy options dict từ row DB
+# Helper
 def get_options(row):
     opts = {}
     if row[3]: opts['A'] = row[3]
@@ -92,13 +80,51 @@ def get_options(row):
     if len(row) > 9 and row[9]: opts['G'] = row[9]
     return opts
 
-# Helper lấy correct (str cho single, set cho multiple)
 def get_correct(correct_str):
     stripped = correct_str.upper().replace(' ', '')
     if ',' in stripped:
         return set(c.strip() for c in stripped.split(','))
     else:
-        return stripped  # str cho single
+        return stripped
+
+def parse_images_json(image_url_str, q_id):
+    """Parse image_url: JSON array hoặc single string, map theo opt từ filename."""
+    image_map = {}
+    if not image_url_str:
+        return image_map
+    
+    # Handle single string (câu 48)
+    if not image_url_str.startswith('['):
+        filename = image_url_str.split('/')[-1]
+        match = re.match(r'question(\d+)(_[A-G])?\.jpg', filename)
+        if match:
+            num = match.group(1)
+            opt = match.group(2)[1] if match.group(2) else 'general'
+            if num == str(q_id):
+                image_map[opt] = image_url_str
+        logger.debug(f"Single image for {q_id}: {image_map}")
+        return image_map
+    
+    # Handle JSON array (câu 30)
+    try:
+        urls = json.loads(image_url_str)
+        for url in urls:
+            filename = url.split('/')[-1]
+            match = re.match(r'question(\d+)_([A-G])\.jpg', filename)
+            if match:
+                num = match.group(1)
+                opt = match.group(2)
+                if num == str(q_id):
+                    image_map[opt] = url
+            else:
+                # Fallback general nếu không match opt
+                image_map['general'] = url
+        logger.debug(f"JSON images for {q_id}: {image_map}")
+    except json.JSONDecodeError:
+        logger.error(f"JSON parse error for {q_id}: {image_url_str}")
+        image_map['general'] = image_url_str
+    
+    return image_map
 
 # Thêm câu hỏi
 async def add_question_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -151,7 +177,6 @@ async def add_options_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_correct_answers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     correct_str = update.message.text.upper().replace(' ', '')
     
-    # Lưu DB
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     e_opt = context.user_data['options'].get('E', '')
@@ -186,37 +211,111 @@ async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-# Tạo exam
-async def create_exam(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+# Xem pool
+async def pool_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('SELECT * FROM questions')
-    all_questions = cursor.fetchall()
+    cursor.execute('SELECT COUNT(*) FROM questions')
+    total = cursor.fetchone()[0]
     conn.close()
-    
-    if len(all_questions) < 65:
-        await update.message.reply_text('Pool chưa đủ 65 câu. Thêm thêm!')
+    await update.message.reply_text(f'Question pool hiện có {total} câu hỏi.')
+
+# Xem câu theo ID
+async def view_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text('Sử dụng: /view_question <ID> (e.g., /view_question 5)')
         return
     
-    selected = random.sample(all_questions, 65)
-    quiz_data = {
-        'questions': [
-            {
-                'id': q[0],
-                'text': q[1],
-                'image': q[2],
-                'options': get_options(q),
-                'num_options': q[10],
-                'correct': get_correct(q[11]),
-                'is_multiple': isinstance(get_correct(q[11]), set)  # True nếu multiple
-            } for q in selected
-        ],
-        'current_index': 0,
-        'answers': {}  # {idx: str (single) hoặc set (multiple)}
-    }
-    user_quizzes[user_id] = quiz_data
-    await show_question(update, context)
+    try:
+        q_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text('ID phải là số nguyên!')
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM questions WHERE id = ?', (q_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        await update.message.reply_text(f'Câu hỏi ID {q_id} không tồn tại!')
+        return
+    
+    q_text = row[1]
+    options = get_options(row)
+    correct_str = row[11]
+    num_opts = row[10]
+    image_map = parse_images_json(row[2], q_id)
+    logger.debug(f"Image map for {q_id}: {image_map}")
+    
+    text = f"Câu {q_id}:\n\n{q_text}\n\nĐáp án:"
+    for i in range(1, num_opts + 1):
+        opt = chr(ord('A') + i - 1)
+        opt_text = options.get(opt, '')
+        opt_link = f" [Xem hình {opt}]({image_map.get(opt, '')})" if image_map.get(opt) else ""
+        text += f"\n{opt}: {opt_text}{opt_link}"
+    
+    if 'general' in image_map:
+        text += f"\n\n[Xem hình chung]({image_map['general']})"
+    
+    text += f"\n\nĐáp án đúng: {correct_str}"
+    
+    await update.message.reply_text(text, parse_mode='Markdown', disable_web_page_preview=False)
+
+# Tạo exam
+async def create_exam_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM questions')
+    total = cursor.fetchone()[0]
+    conn.close()
+    
+    if total == 0:
+        await update.message.reply_text('Pool chưa có câu hỏi nào! Hãy thêm bằng /add_question.')
+        return ConversationHandler.END
+    
+    await update.message.reply_text(f'Pool có {total} câu hỏi. Nhập số câu để random (1-{total}):')
+    return EXAM_COUNT
+
+async def create_exam_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        num_q = int(update.message.text)
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM questions')
+        total = cursor.fetchone()[0]
+        conn.close()
+        
+        if num_q < 1 or num_q > total:
+            await update.message.reply_text(f'Số câu phải từ 1 đến {total}. Thử lại:')
+            return EXAM_COUNT
+        
+        user_id = update.effective_user.id
+        cursor.execute('SELECT * FROM questions')
+        all_questions = cursor.fetchall()
+        selected = random.sample(all_questions, num_q)
+        quiz_data = {
+            'questions': [
+                {
+                    'id': q[0],
+                    'text': q[1],
+                    'image': q[2],
+                    'options': get_options(q),
+                    'num_options': q[10],
+                    'correct': get_correct(q[11]),
+                    'is_multiple': isinstance(get_correct(q[11]), set)
+                } for q in selected
+            ],
+            'current_index': 0,
+            'answers': {}
+        }
+        user_quizzes[user_id] = quiz_data
+        await show_question(update, context)
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text('Số hợp lệ. Thử lại:')
+        return EXAM_COUNT
 
 # Hiển thị câu
 async def show_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -227,20 +326,27 @@ async def show_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     quiz = user_quizzes[user_id]
+    total_q = len(quiz['questions'])
     idx = quiz['current_index']
     q = quiz['questions'][idx]
     
     select_type = "1 đáp án" if not q['is_multiple'] else "tất cả đúng"
-    text = f"Câu {idx+1}/65:\n{q['text']}\n(Chọn {select_type})"
+    q_text = q['text']
+    image_map = parse_images_json(q['image'], q['id'])
+    logger.debug(f"Quiz image map for {q['id']}: {image_map}")
+    
+    text = f"Câu {idx+1}/{total_q}:\n\n{q_text}\n\n(Chọn {select_type})"
     
     # Lấy selected hiện tại
     selected = quiz['answers'].get(idx, '' if not q['is_multiple'] else set())
     
-    # Keyboard động
+    # Keyboard động với image links
     keyboard = []
     for i in range(q['num_options']):
         opt = chr(ord('A') + i)
-        label = f"{opt}: {q['options'][opt]}"
+        opt_text = q['options'][opt]
+        opt_link = f" [img {opt}]({image_map.get(opt, '')})" if image_map.get(opt) else ""
+        label = f"{opt}: {opt_text}{opt_link}"
         if q['is_multiple']:
             if opt in selected:
                 label += ' ✅'
@@ -259,13 +365,9 @@ async def show_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         query = update.callback_query
         await query.answer()
-        await query.edit_message_text(text, reply_markup=reply_markup)
-        if q['image']:
-            await context.bot.send_photo(query.message.chat_id, q['image'])
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown', disable_web_page_preview=False)
     else:
-        await update.message.reply_text(text, reply_markup=reply_markup)
-        if q['image']:
-            await context.bot.send_photo(update.effective_chat.id, q['image'])
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown', disable_web_page_preview=False)
 
 # Callback
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -278,13 +380,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     quiz = user_quizzes[user_id]
+    total_q = len(quiz['questions'])
     idx = quiz['current_index']
     q = quiz['questions'][idx]
     
     if data.startswith('ans_'):
         _, _, idx_str, opt = data.split('_')
         idx = int(idx_str)
-        q = quiz['questions'][idx]  # Re-get for this idx
+        q = quiz['questions'][idx]
         if q['is_multiple']:
             selected = quiz['answers'].setdefault(idx, set())
             if opt in selected:
@@ -294,9 +397,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 selected.add(opt)
                 await query.answer(f"Chọn {opt}")
         else:
-            # Single: thay đổi lựa chọn
             if quiz['answers'].get(idx) == opt:
-                quiz['answers'][idx] = ''  # Unselect
+                quiz['answers'][idx] = ''
                 await query.answer("Bỏ chọn")
             else:
                 quiz['answers'][idx] = opt
@@ -304,7 +406,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_question(update, context)
     
     elif data.startswith('next_'):
-        if idx < 64:
+        if idx < total_q - 1:
             quiz['current_index'] += 1
             await show_question(update, context)
         else:
@@ -360,7 +462,8 @@ def end_quiz(user_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("Thêm câu hỏi", callback_data="add_q")],
-        [InlineKeyboardButton("Tạo đề thi", callback_data="create_exam")]
+        [InlineKeyboardButton("Tạo đề thi", callback_data="create_exam")],
+        [InlineKeyboardButton("Xem pool", callback_data="pool_count")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('Chào! Chọn chức năng:', reply_markup=reply_markup)
@@ -371,7 +474,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "add_q":
         await query.edit_message_text("Dùng /add_question để thêm.")
     elif query.data == "create_exam":
-        await create_exam(update, context)
+        return await create_exam_start(update, context)
+    elif query.data == "pool_count":
+        await pool_count(update, context)
 
 async def finish_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -392,16 +497,19 @@ def main():
             NUM_OPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_num_options)],
             OPTIONS_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_options_input)],
             CORRECT_ANSWERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_correct_answers)],
+            EXAM_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_exam_count)],
         },
         fallbacks=[CommandHandler('cancel', cancel_add)],
     )
     
     application.add_handler(CommandHandler('start', start))
     application.add_handler(conv_handler)
-    application.add_handler(CommandHandler('create_exam', create_exam))
+    application.add_handler(CommandHandler('pool_count', pool_count))
+    application.add_handler(CommandHandler('view_question', view_question))
+    application.add_handler(CommandHandler('create_exam', create_exam_start))
     application.add_handler(CommandHandler('finish_quiz', finish_quiz))
     application.add_handler(CallbackQueryHandler(handle_callback, pattern='^(ans_|next_|back_|confirm_)'))
-    application.add_handler(CallbackQueryHandler(button_handler, pattern='^(add_q|create_exam)'))
+    application.add_handler(CallbackQueryHandler(button_handler, pattern='^(add_q|create_exam|pool_count)'))
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
