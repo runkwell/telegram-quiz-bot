@@ -59,7 +59,7 @@ def migrate_db():
 migrate_db()
 
 # Trạng thái Conversation
-QUESTION_TEXT, IMAGE_URL, NUM_OPTIONS, OPTIONS_INPUT, CORRECT_ANSWERS, EXAM_COUNT = range(6)
+QUESTION_TEXT, IMAGE_URL, NUM_OPTIONS, OPTIONS_INPUT, CORRECT_ANSWERS = range(5)
 
 # Lưu trạng thái quiz
 user_quizzes = {}
@@ -218,7 +218,14 @@ async def pool_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute('SELECT COUNT(*) FROM questions')
     total = cursor.fetchone()[0]
     conn.close()
-    await update.message.reply_text(f'Question pool hiện có {total} câu hỏi.')
+    
+    msg = f'Question pool hiện có {total} câu hỏi.'
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        await query.message.reply_text(msg)
+    else:
+        await update.message.reply_text(msg)
 
 # Xem câu theo ID
 async def view_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -269,53 +276,71 @@ async def create_exam_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor = conn.cursor()
     cursor.execute('SELECT COUNT(*) FROM questions')
     total = cursor.fetchone()[0]
-    conn.close()
+    conn.close()  # Đóng sau query đầu
     
     if total == 0:
-        await update.message.reply_text('Pool chưa có câu hỏi nào! Hãy thêm bằng /add_question.')
+        msg = 'Pool chưa có câu hỏi nào! Hãy thêm bằng /add_question.'
+        if update.callback_query:
+            query = update.callback_query
+            await query.answer()
+            await query.message.reply_text(msg)
+        else:
+            await update.message.reply_text(msg)
         return ConversationHandler.END
     
-    await update.message.reply_text(f'Pool có {total} câu hỏi. Nhập số câu để random (1-{total}):')
+    msg = f'Pool có {total} câu hỏi. Nhập số câu để random (1-{total}):'
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        await query.message.reply_text(msg)
+    else:
+        await update.message.reply_text(msg)
     return EXAM_COUNT
 
-async def create_exam_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        num_q = int(update.message.text)
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM questions')
-        total = cursor.fetchone()[0]
-        conn.close()
-        
-        if num_q < 1 or num_q > total:
-            await update.message.reply_text(f'Số câu phải từ 1 đến {total}. Thử lại:')
-            return EXAM_COUNT
-        
-        user_id = update.effective_user.id
-        cursor.execute('SELECT * FROM questions')
-        all_questions = cursor.fetchall()
-        selected = random.sample(all_questions, num_q)
-        quiz_data = {
-            'questions': [
-                {
-                    'id': q[0],
-                    'text': q[1],
-                    'image': q[2],
-                    'options': get_options(q),
-                    'num_options': q[10],
-                    'correct': get_correct(q[11]),
-                    'is_multiple': isinstance(get_correct(q[11]), set)
-                } for q in selected
-            ],
-            'current_index': 0,
-            'answers': {}
-        }
-        user_quizzes[user_id] = quiz_data
-        await show_question(update, context)
+    # Mở connection mới cho query thứ 2
+    conn2 = sqlite3.connect(DB_FILE)
+    cursor2 = conn2.cursor()
+    cursor2.execute('SELECT * FROM questions')
+    all_questions = cursor2.fetchall()
+    conn2.close()
+    
+    # Random và tạo quiz (phần này thêm vào cuối hàm, sau return EXAM_COUNT nếu có prompt; nếu tự động 65, thay EXAM_COUNT bằng logic random)
+    # Ví dụ tự động 65 (nếu bạn muốn loại bỏ prompt):
+    if total < 65:
+        msg = f'Pool chưa đủ 65 câu (chỉ có {total}). Hãy thêm thêm!'
+        if update.callback_query:
+            await query.message.reply_text(msg)
+        else:
+            await update.message.reply_text(msg)
         return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text('Số hợp lệ. Thử lại:')
-        return EXAM_COUNT
+    
+    selected = random.sample(all_questions, 65)
+    user_id = update.effective_user.id
+    quiz_data = {
+        'questions': [
+            {
+                'id': q[0],
+                'text': q[1],
+                'image': q[2],
+                'options': get_options(q),
+                'num_options': q[10],
+                'correct': get_correct(q[11]),
+                'is_multiple': isinstance(get_correct(q[11]), set)
+            } for q in selected
+        ],
+        'current_index': 0,
+        'answers': {}
+    }
+    user_quizzes[user_id] = quiz_data
+    
+    msg = f'Đã tạo đề thi 65 câu! Bắt đầu quiz...'
+    if update.callback_query:
+        await query.message.reply_text(msg)
+    else:
+        await update.message.reply_text(msg)
+    
+    await show_question(update, context)
+    return ConversationHandler.END
 
 # Hiển thị câu
 async def show_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -490,16 +515,15 @@ def main():
     application = Application.builder().token(TOKEN).build()
     
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('add_question', add_question_start)],
-        states={
-            QUESTION_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_question_text)],
-            IMAGE_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_question_image)],
-            NUM_OPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_num_options)],
-            OPTIONS_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_options_input)],
-            CORRECT_ANSWERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_correct_answers)],
-            EXAM_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_exam_count)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel_add)],
+    entry_points=[CommandHandler('add_question', add_question_start)],
+    states={
+        QUESTION_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_question_text)],
+        IMAGE_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_question_image)],
+        NUM_OPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_num_options)],
+        OPTIONS_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_options_input)],
+        CORRECT_ANSWERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_correct_answers)],
+    },
+    fallbacks=[CommandHandler('cancel', cancel_add)],
     )
     
     application.add_handler(CommandHandler('start', start))
